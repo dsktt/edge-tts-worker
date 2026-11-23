@@ -1,25 +1,10 @@
 # edge-tts-worker
 
+**English** | [简体中文](./README.zh-CN.md)
+
 Deploy Microsoft Edge TTS as an OpenAI-compatible API on your own Cloudflare account. Free.
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/sofish/edge-tts-worker)
-
-## 中文说明
-
-将微软 Edge TTS 部署到 Cloudflare Workers，提供免费、兼容 OpenAI 协议的语音合成 API、WebSocket 流式接口以及自带网页测试界面。
-
-- **主要接口**：
-  - `GET /`：自带的网页试听测试页
-  - `POST /v1/audio/speech`：OpenAI 兼容的 MP3 语音合成接口（不传 `voice` 时自动识别中/日/韩/英文音色）
-  - `GET /v1/ws`：WebSocket 长连接流式合成接口，适合阅读器逐段连续播报
-  - `GET /v1/voices`：获取可用音色列表
-- **部署与鉴权**：
-  - 本地手动部署：执行 `npm install && npx wrangler deploy`
-  - 自动部署：推送到 `main` 分支后，可通过 Cloudflare Workers Builds 或 GitHub Actions（需配置 `CF_API_TOKEN` 与 `CF_ACCOUNT_ID` Secrets）自动发布
-  - 可选鉴权：运行 `npx wrangler secret put API_KEY` 设置密钥（设置后接口需传 `Authorization: Bearer <key>`，WebSocket 需带 `?token=<key>`；注意自带网页测试页未传鉴权头）
-- **使用提示**：
-  - 已适配微软新版 `Sec-MS-GEC` v2 鉴权（见 `src/drm.ts`）；若未来微软再次调整接口或浏览器版本，需同步更新 `CHROMIUM_FULL_VERSION`
-  - 若在国内访问默认 `*.workers.dev` 域名不稳定，建议在 Cloudflare Worker 中绑定自定义域名
 
 ## Deploy
 
@@ -114,6 +99,11 @@ A minimal HTML test page with text input, voice selector, speed slider, and play
 npm install
 npm run dev
 ```
+
+## Notes
+
+- Updated for Microsoft's `Sec-MS-GEC` v2 authentication (`src/drm.ts`). If Microsoft changes the protocol or browser version requirements in the future, update `CHROMIUM_FULL_VERSION` accordingly.
+- If `*.workers.dev` is unstable or unreachable from your network (e.g. in mainland China), bind a custom domain to your Cloudflare Worker.
 
 ## Disclaimer
 
