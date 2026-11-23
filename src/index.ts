@@ -433,6 +433,23 @@ async function handleVoices(request: Request, env: Env): Promise<Response> {
   return Response.json(cachedVoices, { headers: corsHeaders() });
 }
 
+function handleModels(request: Request, env: Env): Response {
+  const authError = checkAuth(request, env);
+  if (authError) return authError;
+
+  return Response.json(
+    {
+      object: "list",
+      data: [
+        { id: "tts-1", object: "model", owned_by: "openai" },
+        { id: "tts-1-hd", object: "model", owned_by: "openai" },
+        { id: "gpt-4o-mini-tts", object: "model", owned_by: "openai" },
+      ],
+    },
+    { headers: corsHeaders() },
+  );
+}
+
 function handleIndex(): Response {
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -666,22 +683,28 @@ export default {
       return new Response(null, { status: 204, headers: corsHeaders() });
     }
 
-    if (url.pathname === "/" && request.method === "GET") {
+    const path = url.pathname.replace(/\/+$/, "") || "/";
+
+    if (path === "/" && request.method === "GET") {
       return handleIndex();
     }
 
-    if ((url.pathname === "/v1/audio/speech" || url.pathname === "/audio/speech") && request.method === "POST") {
+    if (path.endsWith("/audio/speech") && request.method === "POST") {
       return handleSpeech(request, env, ctx);
     }
 
-    if (url.pathname === "/v1/ws") {
-      return handleWebSocket(request, env, ctx);
+    if (path.endsWith("/models") && request.method === "GET") {
+      return handleModels(request, env);
     }
 
-    if (url.pathname === "/v1/voices" && request.method === "GET") {
+    if (path.endsWith("/voices") && request.method === "GET") {
       return handleVoices(request, env);
     }
 
-    return errorResponse("Not found", 404);
+    if (path === "/v1/ws" || path === "/ws") {
+      return handleWebSocket(request, env, ctx);
+    }
+
+    return errorResponse(`Not found: ${request.method} ${url.pathname}`, 404);
   },
 } satisfies ExportedHandler<Env>;
