@@ -93,6 +93,33 @@ function detectVoice(text: string, gender: string = "female"): string {
   return VOICE_MAP.en[g];
 }
 
+const OPENAI_VOICE_GENDER: Record<string, "female" | "male"> = {
+  alloy: "female",
+  coral: "female",
+  fable: "female",
+  nova: "female",
+  sage: "female",
+  shimmer: "female",
+  marin: "female",
+  ash: "male",
+  ballad: "male",
+  echo: "male",
+  onyx: "male",
+  verse: "male",
+  cedar: "male",
+};
+
+function selectVoice(input: string, requestedVoice?: string, gender?: string): string {
+  if (!requestedVoice) {
+    return detectVoice(input, gender);
+  }
+  const mappedGender = OPENAI_VOICE_GENDER[requestedVoice.toLowerCase()];
+  if (mappedGender) {
+    return detectVoice(input, mappedGender);
+  }
+  return requestedVoice;
+}
+
 function mkssml(voice: string, rate: string, volume: string, pitch: string, text: string): string {
   return `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'><voice name='${voice}'><prosody pitch='${pitch}' rate='${rate}' volume='${volume}'>${text}</prosody></voice></speak>`;
 }
@@ -336,7 +363,7 @@ async function handleSpeech(request: Request, env: Env, ctx: ExecutionContext): 
     return errorResponse("'input' is required and must be a non-empty string", 400);
   }
 
-  const voice = body.voice || detectVoice(input, body.gender);
+  const voice = selectVoice(input, body.voice, body.gender);
   const speed = Math.min(2, Math.max(0.5, body.speed ?? 1.0));
   const rateValue = Math.round((speed - 1) * 100);
   const rate = rateValue >= 0 ? `+${rateValue}%` : `${rateValue}%`;
@@ -420,12 +447,16 @@ function handleIndex(): Response {
   h1 { font-size: 20px; margin-bottom: 24px; }
   label { display: block; font-size: 14px; font-weight: 500; margin-bottom: 6px; color: #555; }
   textarea { width: 100%; height: 100px; padding: 10px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; resize: vertical; font-family: inherit; }
-  select, input[type=range] { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; }
+  select, input[type=range], input[type=password] { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 8px; font-size: 14px; }
   .field { margin-bottom: 16px; }
+  .key-row { display: flex; gap: 8px; }
+  .key-row input { flex: 1; }
   .speed-value { font-size: 13px; color: #888; float: right; }
   button { width: 100%; padding: 12px; background: #2563eb; color: #fff; border: none; border-radius: 8px; font-size: 15px; font-weight: 500; cursor: pointer; }
   button:hover { background: #1d4ed8; }
   button:disabled { background: #93c5fd; cursor: not-allowed; }
+  .btn-secondary { width: auto; padding: 8px 14px; background: #e5e7eb; color: #374151; font-size: 13px; white-space: nowrap; }
+  .btn-secondary:hover { background: #d1d5db; }
   audio { width: 100%; margin-top: 16px; }
   .error { color: #dc2626; font-size: 13px; margin-top: 8px; }
 </style>
@@ -434,12 +465,19 @@ function handleIndex(): Response {
 <div class="container">
   <h1>Edge TTS Worker</h1>
   <div class="field">
+    <label for="api-key">API Key (optional)</label>
+    <div class="key-row">
+      <input type="password" id="api-key" placeholder="Enter API key if enabled">
+      <button type="button" id="load-voices" class="btn-secondary">Load Voices</button>
+    </div>
+  </div>
+  <div class="field">
     <label for="text">Text</label>
     <textarea id="text" placeholder="Enter text to synthesize...">Hello! This is a test of the Edge TTS Worker.</textarea>
   </div>
   <div class="field">
     <label for="voice">Voice</label>
-    <select id="voice"><option>Loading voices...</option></select>
+    <select id="voice"><option value="">Loading voices...</option></select>
   </div>
   <div class="field">
     <label>Speed <span class="speed-value" id="speed-label">1.0x</span></label>
@@ -450,20 +488,45 @@ function handleIndex(): Response {
   <audio id="audio" controls style="display:none"></audio>
 </div>
 <script>
+  const apiKeyInput = document.getElementById('api-key');
+  const loadVoicesBtn = document.getElementById('load-voices');
   const voiceSelect = document.getElementById('voice');
   const speedInput = document.getElementById('speed');
   const speedLabel = document.getElementById('speed-label');
   const playBtn = document.getElementById('play');
   const audioEl = document.getElementById('audio');
   const errorEl = document.getElementById('error');
+  const STORAGE_KEY = 'edge_tts_api_key';
+
+  try {
+    apiKeyInput.value = localStorage.getItem(STORAGE_KEY) || '';
+  } catch {}
+
+  apiKeyInput.addEventListener('input', () => {
+    try { localStorage.setItem(STORAGE_KEY, apiKeyInput.value.trim()); } catch {}
+  });
 
   speedInput.addEventListener('input', () => {
     speedLabel.textContent = parseFloat(speedInput.value).toFixed(1) + 'x';
   });
 
-  fetch('/v1/voices')
-    .then(r => r.json())
-    .then(voices => {
+  function authHeaders() {
+    const key = apiKeyInput.value.trim();
+    return key ? { Authorization: 'Bearer ' + key } : {};
+  }
+
+  async function loadVoices() {
+    try {
+      const r = await fetch('/v1/voices', { headers: authHeaders() });
+      if (r.status === 401) {
+        voiceSelect.innerHTML = '<option value="">Enter API Key to load voices</option>';
+        errorEl.textContent = 'Please enter a valid API Key';
+        return;
+      }
+      if (!r.ok) {
+        throw new Error('Failed to load voices (' + r.status + ')');
+      }
+      const voices = await r.json();
       voiceSelect.innerHTML = '';
       voices.forEach(v => {
         const opt = document.createElement('option');
@@ -472,8 +535,17 @@ function handleIndex(): Response {
         if (v.ShortName === 'en-US-EmmaMultilingualNeural') opt.selected = true;
         voiceSelect.appendChild(opt);
       });
-    })
-    .catch(() => { voiceSelect.innerHTML = '<option>Failed to load voices</option>'; });
+      if (errorEl.textContent === 'Please enter a valid API Key') {
+        errorEl.textContent = '';
+      }
+    } catch {
+      voiceSelect.innerHTML = '<option value="">Failed to load voices</option>';
+    }
+  }
+
+  loadVoicesBtn.addEventListener('click', loadVoices);
+  apiKeyInput.addEventListener('change', loadVoices);
+  loadVoices();
 
   async function synthesize() {
     const text = document.getElementById('text').value.trim();
@@ -484,11 +556,11 @@ function handleIndex(): Response {
     try {
       const res = await fetch('/v1/audio/speech', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({
           model: 'tts-1',
           input: text,
-          voice: voiceSelect.value,
+          voice: voiceSelect.value || undefined,
           speed: parseFloat(speedInput.value),
           response_format: 'mp3'
         })
@@ -564,7 +636,7 @@ async function handleWebSocket(request: Request, env: Env, ctx: ExecutionContext
         return;
       }
 
-      const voice = msg.voice || detectVoice(input, msg.gender);
+      const voice = selectVoice(input, msg.voice, msg.gender);
       const speed = Math.min(2, Math.max(0.5, msg.speed ?? 1.0));
       const rateValue = Math.round((speed - 1) * 100);
       const rate = rateValue >= 0 ? `+${rateValue}%` : `${rateValue}%`;
@@ -598,7 +670,7 @@ export default {
       return handleIndex();
     }
 
-    if (url.pathname === "/v1/audio/speech" && request.method === "POST") {
+    if ((url.pathname === "/v1/audio/speech" || url.pathname === "/audio/speech") && request.method === "POST") {
       return handleSpeech(request, env, ctx);
     }
 
