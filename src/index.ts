@@ -1,21 +1,23 @@
+import {
+  CHROMIUM_MAJOR_VERSION,
+  generateSecMsGecV2,
+  SEC_MS_GEC_VERSION,
+  TRUSTED_CLIENT_TOKEN,
+} from "./drm";
+
 interface Env {
   API_KEY?: string;
 }
 
 // --- Edge TTS Protocol Constants ---
-const TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
-const CHROMIUM_FULL_VERSION = "143.0.3650.75";
-const CHROMIUM_MAJOR_VERSION = CHROMIUM_FULL_VERSION.split(".")[0];
-const SEC_MS_GEC_VERSION = `1-${CHROMIUM_FULL_VERSION}`;
 const BASE_URL = "speech.platform.bing.com/consumer/speech/synthesize/readaloud";
 const WSS_URL = `wss://${BASE_URL}/edge/v1?TrustedClientToken=${TRUSTED_CLIENT_TOKEN}`;
 const VOICE_LIST_URL = `https://${BASE_URL}/voices/list?trustedclienttoken=${TRUSTED_CLIENT_TOKEN}`;
-const WIN_EPOCH = 11644473600;
-const S_TO_NS = 1e9;
 
 const USER_AGENT = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROMIUM_MAJOR_VERSION}.0.0.0 Safari/537.36 Edg/${CHROMIUM_MAJOR_VERSION}.0.0.0`;
 const WSS_HEADERS: Record<string, string> = {
   "User-Agent": USER_AGENT,
+  "Accept-Language": "en-US,en;q=0.9",
   "Pragma": "no-cache",
   "Cache-Control": "no-cache",
   "Origin": "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold",
@@ -38,16 +40,7 @@ let cachedVoices: Voice[] | null = null;
 let clockSkewSeconds = 0;
 
 async function generateSecMsGec(): Promise<string> {
-  let ticks = Date.now() / 1000 + clockSkewSeconds;
-  ticks += WIN_EPOCH;
-  ticks -= ticks % 300;
-  ticks *= S_TO_NS / 100;
-  const strToHash = `${ticks.toFixed(0)}${TRUSTED_CLIENT_TOKEN}`;
-  const encoder = new TextEncoder();
-  const data = encoder.encode(strToHash);
-  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-  const hashArray = new Uint8Array(hashBuffer);
-  return Array.from(hashArray).map(b => b.toString(16).padStart(2, "0")).join("").toUpperCase();
+  return generateSecMsGecV2(Date.now() / 1000 + clockSkewSeconds);
 }
 
 function generateMuid(): string {
@@ -156,6 +149,52 @@ function getHeadersAndDataFromText(text: string): [Record<string, string>, strin
 }
 
 // --- TTS Streaming via WebSocket (Cloudflare Workers compatible) ---
+async function openTtsWebSocket(): Promise<WebSocket> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const secMsGec = await generateSecMsGec();
+    const connId = connectId();
+    const url = `${WSS_URL}&Sec-MS-GEC=${secMsGec}&Sec-MS-GEC-Version=${SEC_MS_GEC_VERSION}&ConnectionId=${connId}`;
+
+    // Cloudflare Workers: connect via fetch with Upgrade header (use https:// instead of wss://)
+    const httpUrl = url.replace("wss://", "https://");
+    const resp = await fetch(httpUrl, {
+      headers: {
+        ...WSS_HEADERS,
+        "Upgrade": "websocket",
+        "Cookie": `muid=${generateMuid()};`,
+      },
+    });
+
+    if (resp.webSocket) {
+      return resp.webSocket;
+    }
+
+    if (resp.status === 403 && attempt === 0) {
+      const dateHeader = resp.headers.get("Date");
+      if (dateHeader) {
+        const serverMs = Date.parse(dateHeader);
+        if (!Number.isNaN(serverMs)) {
+          const serverSeconds = serverMs / 1000;
+          const clientSeconds = Date.now() / 1000 + clockSkewSeconds;
+          clockSkewSeconds += serverSeconds - clientSeconds;
+          await resp.body?.cancel();
+          continue;
+        }
+      }
+    }
+
+    let detail = "";
+    try {
+      const text = (await resp.text()).trim();
+      if (text) detail = `: ${text.slice(0, 200)}`;
+    } catch {
+      // Ignore response body read errors
+    }
+    throw new Error(`WebSocket upgrade failed (HTTP ${resp.status})${detail}`);
+  }
+  throw new Error("WebSocket upgrade failed");
+}
+
 async function* ttsStream(
   text: string,
   voice: string,
@@ -165,24 +204,7 @@ async function* ttsStream(
 ): AsyncGenerator<Uint8Array> {
   const escapedText = escapeXml(removeIncompatibleCharacters(text));
   const fullVoice = resolveVoiceName(voice);
-  const secMsGec = await generateSecMsGec();
-  const connId = connectId();
-  const url = `${WSS_URL}&Sec-MS-GEC=${secMsGec}&Sec-MS-GEC-Version=${SEC_MS_GEC_VERSION}&ConnectionId=${connId}`;
-
-  // Cloudflare Workers: connect via fetch with Upgrade header (use https:// instead of wss://)
-  const httpUrl = url.replace("wss://", "https://");
-  const resp = await fetch(httpUrl, {
-    headers: {
-      ...WSS_HEADERS,
-      "Upgrade": "websocket",
-      "Cookie": `muid=${generateMuid()};`,
-    },
-  });
-
-  const ws = resp.webSocket;
-  if (!ws) {
-    throw new Error(`WebSocket upgrade failed (HTTP ${resp.status})`);
-  }
+  const ws = await openTtsWebSocket();
   ws.accept();
 
   type QueueItem = { type: "audio"; data: Uint8Array } | { type: "close" } | { type: "error"; error: string };
@@ -222,38 +244,46 @@ async function* ttsStream(
     notify();
   });
 
-  // Send speech config
-  ws.send(
-    `X-Timestamp:${dateToString()}\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"true"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}\r\n`
-  );
+  try {
+    // Send speech config
+    ws.send(
+      `X-Timestamp:${dateToString()}\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"true"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}\r\n`
+    );
 
-  // Send SSML
-  const ssml = mkssml(fullVoice, rate, volume, pitch, escapedText);
-  ws.send(ssmlHeadersPlusData(connectId(), dateToString(), ssml));
+    // Send SSML
+    const ssml = mkssml(fullVoice, rate, volume, pitch, escapedText);
+    ws.send(ssmlHeadersPlusData(connectId(), dateToString(), ssml));
 
-  // Yield audio chunks
-  let audioReceived = false;
-  while (true) {
-    if (messageQueue.length > 0) {
-      const msg = messageQueue.shift()!;
-      if (msg.type === "close") {
-        break;
-      } else if (msg.type === "error") {
-        throw new Error(msg.error);
-      } else if (msg.type === "audio") {
-        audioReceived = true;
-        yield msg.data;
+    // Yield audio chunks
+    let audioReceived = false;
+    while (true) {
+      if (messageQueue.length > 0) {
+        const msg = messageQueue.shift()!;
+        if (msg.type === "close") {
+          break;
+        } else if (msg.type === "error") {
+          throw new Error(msg.error);
+        } else if (msg.type === "audio") {
+          audioReceived = true;
+          yield msg.data;
+        }
+      } else {
+        await new Promise<void>((resolve) => {
+          resolveMessage = resolve;
+          setTimeout(resolve, 50);
+        });
       }
-    } else {
-      await new Promise<void>((resolve) => {
-        resolveMessage = resolve;
-        setTimeout(resolve, 50);
-      });
     }
-  }
 
-  if (!audioReceived) {
-    throw new Error("No audio was received from TTS service");
+    if (!audioReceived) {
+      throw new Error("No audio was received from TTS service");
+    }
+  } finally {
+    try {
+      ws.close();
+    } catch {
+      // Ignore close errors if already closed
+    }
   }
 }
 
@@ -311,25 +341,37 @@ async function handleSpeech(request: Request, env: Env, ctx: ExecutionContext): 
   const rateValue = Math.round((speed - 1) * 100);
   const rate = rateValue >= 0 ? `+${rateValue}%` : `${rateValue}%`;
 
+  const stream = ttsStream(input, voice, rate);
+  let firstChunk: IteratorResult<Uint8Array>;
+  try {
+    firstChunk = await stream.next();
+  } catch (e: any) {
+    console.error("TTS stream error:", e);
+    return errorResponse(`TTS failed: ${e?.message || "Unknown error"}`, 502);
+  }
+  if (firstChunk.done) {
+    return errorResponse("TTS failed: No audio was received from TTS service", 502);
+  }
+
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
 
   ctx.waitUntil((async () => {
     try {
-      for await (const audioData of ttsStream(input, voice, rate)) {
+      await writer.write(firstChunk.value);
+      for await (const audioData of stream) {
         await writer.write(audioData);
       }
     } catch (e) {
       console.error("TTS stream error:", e);
     } finally {
-      await writer.close();
+      await writer.close().catch(() => {});
     }
   })());
 
   return new Response(readable, {
     headers: {
       "Content-Type": "audio/mpeg",
-      "Transfer-Encoding": "chunked",
       ...corsHeaders(),
     },
   });
@@ -452,14 +494,26 @@ function handleIndex(): Response {
         })
       });
       if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.error?.message || 'Request failed');
+        const bodyText = await res.text();
+        let msg = 'Request failed (' + res.status + ')';
+        try {
+          const err = JSON.parse(bodyText);
+          if (err.error?.message) msg = err.error.message;
+        } catch {
+          if (bodyText) msg = bodyText;
+        }
+        throw new Error(msg);
       }
       const blob = await res.blob();
+      if (blob.size === 0) {
+        throw new Error('No audio returned');
+      }
       const url = URL.createObjectURL(blob);
       audioEl.src = url;
       audioEl.style.display = 'block';
-      audioEl.play();
+      await audioEl.play().catch((err) => {
+        throw new Error('Playback failed: ' + (err?.message || err));
+      });
     } catch (e) {
       errorEl.textContent = e.message;
     } finally {
