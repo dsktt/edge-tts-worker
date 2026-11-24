@@ -565,7 +565,9 @@ async function handleVoices(request: Request, env: Env): Promise<Response> {
 
   const reqUrl = new URL(request.url);
   const showAll = reqUrl.searchParams.get("all") === "1";
-  const result = showAll ? cachedVoices : cachedVoices.filter((v) => v.Locale === "zh-CN");
+  const result = showAll
+    ? cachedVoices
+    : cachedVoices.filter((v) => v.Locale === "zh-CN" || v.Locale.startsWith("zh-CN-"));
   return Response.json(result, { headers: corsHeaders() });
 }
 
@@ -590,7 +592,12 @@ function handleIndex(): Response {
   const mappingRows = Object.entries(OPENAI_VOICE_MAP)
     .map(([oa, edge]) => `<tr><td><code>${oa}</code></td><td>${CN_VOICE_LABELS[edge] || edge}</td><td><code>${edge}</code></td></tr>`)
     .join("");
+  const edgeToOpenAI: Record<string, string[]> = {};
+  for (const [oa, edge] of Object.entries(OPENAI_VOICE_MAP)) {
+    (edgeToOpenAI[edge] ??= []).push(oa);
+  }
   const cnLabelsJson = JSON.stringify(CN_VOICE_LABELS);
+  const edgeToOpenAIJson = JSON.stringify(edgeToOpenAI);
 
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -661,6 +668,7 @@ function handleIndex(): Response {
 </div>
 <script>
   const CN_LABELS = ${cnLabelsJson};
+  const EDGE_TO_OPENAI = ${edgeToOpenAIJson};
   const apiKeyInput = document.getElementById('api-key');
   const loadVoicesBtn = document.getElementById('load-voices');
   const voiceSelect = document.getElementById('voice');
@@ -708,7 +716,12 @@ function handleIndex(): Response {
         const opt = document.createElement('option');
         opt.value = v.ShortName;
         const label = CN_LABELS[v.ShortName];
-        opt.textContent = label ? (label + ' (' + v.ShortName + ')') : (v.ShortName + ' (' + v.Gender + ')');
+        const oaNames = EDGE_TO_OPENAI[v.ShortName];
+        if (oaNames && oaNames.length) {
+          opt.textContent = (label || v.ShortName) + ' [' + oaNames.join(' / ') + '] (' + v.ShortName + ')';
+        } else {
+          opt.textContent = label ? (label + ' (' + v.ShortName + ')') : (v.ShortName + ' (' + v.Gender + ')');
+        }
         if (v.ShortName === 'zh-CN-XiaoxiaoNeural') opt.selected = true;
         voiceSelect.appendChild(opt);
       });
