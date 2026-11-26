@@ -14,10 +14,11 @@ const BASE_URL = "speech.platform.bing.com/consumer/speech/synthesize/readaloud"
 const WSS_URL = `wss://${BASE_URL}/edge/v1?TrustedClientToken=${TRUSTED_CLIENT_TOKEN}`;
 const VOICE_LIST_URL = `https://${BASE_URL}/voices/list?trustedclienttoken=${TRUSTED_CLIENT_TOKEN}`;
 
-const CONNECT_TIMEOUT_MS = 10_000;
-const IDLE_TIMEOUT_MS = 12_000;
-const TOTAL_TIMEOUT_MS = 30_000;
-const MAX_CHUNK_CHARS = 1500;
+const CONNECT_TIMEOUT_MS = 5_000;
+const FIRST_CHUNK_TIMEOUT_MS = 5_000;
+const IDLE_TIMEOUT_MS = 8_000;
+const TOTAL_TIMEOUT_MS = 45_000;
+const MAX_CHUNK_CHARS = 800;
 
 const USER_AGENT = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROMIUM_MAJOR_VERSION}.0.0.0 Safari/537.36 Edg/${CHROMIUM_MAJOR_VERSION}.0.0.0`;
 const WSS_HEADERS: Record<string, string> = {
@@ -185,6 +186,25 @@ function splitText(text: string, maxChars: number = MAX_CHUNK_CHARS): string[] {
   return chunks;
 }
 
+function hasSpeakableText(text: string): boolean {
+  return /[\p{L}\p{N}]/u.test(text);
+}
+
+function createSilentMp3(frames: number = 5): Uint8Array {
+  const frameSize = 144;
+  const buf = new Uint8Array(frames * frameSize);
+  for (let i = 0; i < frames; i++) {
+    const offset = i * frameSize;
+    buf[offset] = 0xff;
+    buf[offset + 1] = 0xf3;
+    buf[offset + 2] = 0x64;
+    buf[offset + 3] = 0xc4;
+  }
+  return buf;
+}
+
+const SILENT_MP3 = createSilentMp3();
+
 // --- Binary Protocol Parsing ---
 function getHeadersAndDataFromBinary(buffer: Uint8Array): [Record<string, string>, Uint8Array] {
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
@@ -296,6 +316,7 @@ async function* ttsStream(
   const messageQueue: QueueItem[] = [];
   let resolveMessage: (() => void) | null = null;
   let ended = false;
+  let lastActivityAt = Date.now();
 
   const notify = () => {
     if (resolveMessage) {
@@ -336,6 +357,7 @@ async function* ttsStream(
   }
 
   ws.addEventListener("message", (event) => {
+    lastActivityAt = Date.now();
     const data = event.data;
     if (typeof data === "string") {
       const [headers] = getHeadersAndDataFromText(data);
@@ -371,17 +393,17 @@ async function* ttsStream(
   try {
     // Send speech config
     ws.send(
-      `X-Timestamp:${dateToString()}\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"true"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}\r\n`
+      `X-Timestamp:${dateToString()}\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"false"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}\r\n`
     );
 
     // Send SSML
     const ssml = mkssml(fullVoice, rate, volume, pitch, escapedText, xmlLang);
     ws.send(ssmlHeadersPlusData(connectId(), dateToString(), ssml));
 
-    // Yield audio chunks with idle & total timeouts
+    // Yield audio chunks with first-chunk, idle & total timeouts
     let audioReceived = false;
     const startedAt = Date.now();
-    let lastActivityAt = startedAt;
+    lastActivityAt = startedAt;
 
     while (true) {
       if (signal?.aborted) {
@@ -404,7 +426,10 @@ async function* ttsStream(
         if (now - startedAt > TOTAL_TIMEOUT_MS) {
           throw new Error("TTS synthesis timed out");
         }
-        if (now - lastActivityAt > IDLE_TIMEOUT_MS) {
+        if (!audioReceived && now - startedAt > FIRST_CHUNK_TIMEOUT_MS) {
+          throw new Error("TTS first audio chunk timed out");
+        }
+        if (audioReceived && now - lastActivityAt > IDLE_TIMEOUT_MS) {
           throw new Error("TTS stream stalled");
         }
         await new Promise<void>((resolve) => {
@@ -427,30 +452,44 @@ async function* ttsStream(
   }
 }
 
-async function synthesizeToBuffer(
+async function* ttsChunkWithRetry(
   text: string,
   voice: string,
   rate: string,
   signal?: AbortSignal,
-): Promise<Uint8Array> {
-  const textChunks = splitText(text);
-  const audioChunks: Uint8Array[] = [];
-  let totalLength = 0;
-
-  for (const chunk of textChunks) {
-    for await (const data of ttsStream(chunk, voice, rate, signal)) {
-      audioChunks.push(data);
-      totalLength += data.byteLength;
+): AsyncGenerator<Uint8Array> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let yielded = false;
+    try {
+      for await (const data of ttsStream(text, voice, rate, signal)) {
+        yielded = true;
+        yield data;
+      }
+      return;
+    } catch (e: any) {
+      const msg = e?.message || "";
+      const canRetry =
+        attempt === 0 &&
+        !yielded &&
+        !signal?.aborted &&
+        msg !== "Request aborted" &&
+        msg !== "No audio was received from TTS service";
+      if (!canRetry) {
+        throw e;
+      }
     }
   }
+}
 
-  const merged = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const chunk of audioChunks) {
-    merged.set(chunk, offset);
-    offset += chunk.byteLength;
+async function* ttsMultiChunkStream(
+  textChunks: string[],
+  voice: string,
+  rate: string,
+  signal?: AbortSignal,
+): AsyncGenerator<Uint8Array> {
+  for (const chunk of textChunks) {
+    yield* ttsChunkWithRetry(chunk, voice, rate, signal);
   }
-  return merged;
 }
 
 // --- Helpers ---
@@ -507,22 +546,83 @@ async function handleSpeech(request: Request, env: Env): Promise<Response> {
   const rateValue = Math.round((speed - 1) * 100);
   const rate = rateValue >= 0 ? `+${rateValue}%` : `${rateValue}%`;
 
-  try {
-    const audio = await synthesizeToBuffer(input, voice, rate, request.signal);
-    return new Response(audio, {
+  if (!hasSpeakableText(input)) {
+    return new Response(SILENT_MP3, {
       headers: {
         "Content-Type": "audio/mpeg",
-        "Content-Length": String(audio.byteLength),
+        "Content-Length": String(SILENT_MP3.byteLength),
+        "Cache-Control": "no-store",
         "X-Edge-Voice": voice,
         ...corsHeaders(),
       },
     });
+  }
+
+  const streamAbort = new AbortController();
+  const onReqAbort = () => streamAbort.abort("client-abort");
+  if (request.signal.aborted) {
+    streamAbort.abort("client-abort");
+  } else {
+    request.signal.addEventListener("abort", onReqAbort, { once: true });
+  }
+
+  const iterator = ttsMultiChunkStream(splitText(input), voice, rate, streamAbort.signal);
+  let first: IteratorResult<Uint8Array>;
+  try {
+    first = await iterator.next();
   } catch (e: any) {
+    request.signal.removeEventListener("abort", onReqAbort);
+    streamAbort.abort();
+    await iterator.return?.(undefined).catch(() => {});
     console.error("TTS stream error:", e);
     const msg = e?.message || "Unknown error";
     const status = msg === "Request aborted" ? 499 : (msg.includes("timed out") || msg.includes("stalled")) ? 504 : 502;
     return errorResponse(`TTS failed: ${msg}`, status);
   }
+
+  if (first.done || !first.value) {
+    request.signal.removeEventListener("abort", onReqAbort);
+    streamAbort.abort();
+    await iterator.return?.(undefined).catch(() => {});
+    return errorResponse("TTS failed: No audio was received from TTS service", 502);
+  }
+
+  const readable = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(first.value);
+    },
+    async pull(controller) {
+      try {
+        const next = await iterator.next();
+        if (next.done) {
+          request.signal.removeEventListener("abort", onReqAbort);
+          controller.close();
+        } else {
+          controller.enqueue(next.value);
+        }
+      } catch (e) {
+        request.signal.removeEventListener("abort", onReqAbort);
+        streamAbort.abort();
+        await iterator.return?.(undefined).catch(() => {});
+        console.error("TTS pull error:", e);
+        controller.error(e);
+      }
+    },
+    async cancel() {
+      request.signal.removeEventListener("abort", onReqAbort);
+      streamAbort.abort("stream-cancelled");
+      await iterator.return?.(undefined).catch(() => {});
+    },
+  });
+
+  return new Response(readable, {
+    headers: {
+      "Content-Type": "audio/mpeg",
+      "Cache-Control": "no-store",
+      "X-Edge-Voice": voice,
+      ...corsHeaders(),
+    },
+  });
 }
 
 async function handleVoices(request: Request, env: Env): Promise<Response> {
@@ -849,9 +949,13 @@ async function handleWebSocket(request: Request, env: Env, ctx: ExecutionContext
       const rate = rateValue >= 0 ? `+${rateValue}%` : `${rateValue}%`;
 
       try {
-        for await (const chunk of splitText(input)) {
-          for await (const audioData of ttsStream(chunk, voice, rate, wsAbort.signal)) {
-            server.send(audioData);
+        if (!hasSpeakableText(input)) {
+          server.send(SILENT_MP3);
+        } else {
+          for await (const chunk of splitText(input)) {
+            for await (const audioData of ttsChunkWithRetry(chunk, voice, rate, wsAbort.signal)) {
+              server.send(audioData);
+            }
           }
         }
         server.send(JSON.stringify({ event: "done" }));
